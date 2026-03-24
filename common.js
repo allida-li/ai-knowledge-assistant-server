@@ -1,5 +1,4 @@
-
-function splitText(text: string, chunkSize: number = 200): string[] {
+function splitText(text, chunkSize = 200) {
   if (!text || chunkSize <= 0) return [];
 
   const chunks = [];
@@ -12,7 +11,7 @@ function splitText(text: string, chunkSize: number = 200): string[] {
 
 function cosineSimilarity(a, b) {
   if (a.length !== b.length) {
-    throw new Error('Vectors must have the same dimension');
+    throw new Error("Vectors must have the same dimension");
   }
 
   let dot = 0;
