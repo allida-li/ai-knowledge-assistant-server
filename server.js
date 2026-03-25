@@ -139,6 +139,10 @@ function createPreview(text, maxLength = 200) {
   return text.slice(0, maxLength);
 }
 
+function writeStreamMessage(res, payload) {
+  res.write(`${JSON.stringify(payload)}\n`);
+}
+
 async function createEmbedding(input) {
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
@@ -146,6 +150,44 @@ async function createEmbedding(input) {
   });
 
   return response.data[0].embedding;
+}
+
+async function getRelevantContext(question) {
+  const questionEmbedding = await createEmbedding(question);
+
+  const topChunks = knowledgeBase
+    .map((item) => ({
+      text: item.text,
+      score: cosineSimilarity(questionEmbedding, item.embedding)
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, TOP_K);
+
+  return {
+    context: topChunks.map((chunk) => chunk.text).join("\n"),
+    topChunks
+  };
+}
+
+async function createChatStream(question, context) {
+  return openai.chat.completions.create({
+    model: CHAT_MODEL,
+    stream: true,
+    messages: [
+      { role: "system", content: "你是一个企业级知识助手" },
+      { role: "user", content: createPrompt(context, question) }
+    ]
+  });
+}
+
+async function createChatCompletion(question, context) {
+  return openai.chat.completions.create({
+    model: CHAT_MODEL,
+    messages: [
+      { role: "system", content: "你是一个企业级知识助手" },
+      { role: "user", content: createPrompt(context, question) }
+    ]
+  });
 }
 
 async function addTextToKnowledgeBase(text) {
@@ -210,7 +252,7 @@ function sendErrorResponse(res, error, fallbackMessage) {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { question } = req.body;
+    const { question, stream } = req.body;
 
     if (!isNonEmptyString(question)) {
       return res.status(400).json({
@@ -224,30 +266,70 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const questionEmbedding = await createEmbedding(question);
+    const { context, topChunks } = await getRelevantContext(question);
 
-    const topChunks = knowledgeBase
-      .map((item) => ({
-        text: item.text,
-        score: cosineSimilarity(questionEmbedding, item.embedding)
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, TOP_K);
+    if (stream === true) {
+      res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders?.();
 
-    const context = topChunks.map((chunk) => chunk.text).join("\n");
-    const completion = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        { role: "system", content: "你是一个企业级知识助手" },
-        { role: "user", content: createPrompt(context, question) }
-      ]
-    });
+      const completionStream = await createChatStream(question, context);
+      let answer = "";
+
+      writeStreamMessage(res, {
+        type: "start",
+        question,
+        topChunks: topChunks.map((chunk) => ({
+          score: chunk.score,
+          preview: createPreview(chunk.text, 120)
+        }))
+      });
+
+      for await (const chunk of completionStream) {
+        const delta = chunk.choices[0]?.delta?.content ?? "";
+
+        if (!delta) {
+          continue;
+        }
+
+        answer += delta;
+        writeStreamMessage(res, {
+          type: "delta",
+          delta
+        });
+      }
+
+      writeStreamMessage(res, {
+        type: "done",
+        answer: answer || "无法从文档中找到"
+      });
+      res.end();
+      return;
+    }
+
+    const completion = await createChatCompletion(question, context);
 
     res.json({
-      answer: completion.choices[0]?.message?.content ?? "无法从文档中找到"
+      answer: completion.choices[0]?.message?.content ?? "无法从文档中找到",
+      topChunks: topChunks.map((chunk) => ({
+        score: chunk.score,
+        preview: createPreview(chunk.text, 120)
+      }))
     });
   } catch (error) {
     console.error("Chat error:", error);
+
+    if (res.headersSent) {
+      writeStreamMessage(res, {
+        type: "error",
+        error: getErrorMessage(error)
+      });
+      res.end();
+      return;
+    }
+
     sendErrorResponse(res, error, "An error occurred while processing your request");
   }
 });
@@ -267,7 +349,8 @@ app.post("/api/upload", upload.none(), async (req, res) => {
     res.json({
       message: `Successfully processed ${addedChunks} chunks`,
       chunksAdded: addedChunks,
-      chunksCount: knowledgeBase.length
+      chunksCount: knowledgeBase.length,
+      status: "200"
     });
   } catch (error) {
     console.error("Upload error:", error);
@@ -322,7 +405,8 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
       filesCount: files.length,
       chunksAdded: totalChunksAdded,
       chunksCount: knowledgeBase.length,
-      filePreviews
+      filePreviews,
+      status: "200"
     });
   } catch (error) {
     console.error("Upload files error:", error);
