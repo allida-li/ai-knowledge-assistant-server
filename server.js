@@ -17,11 +17,13 @@ app.use(express.json());
 
 const EMBEDDING_MODEL = "text-embedding-v1";
 const CHAT_MODEL = "qwen-turbo";
-const TOP_K = 3;
+const TOP_K = 6;
+const MIN_RELEVANCE_SCORE = 0.2;
 const PDF_MIME_TYPE = "application/pdf";
 const TEXT_MIME_PREFIX = "text/";
 const UTF16LE_BOM = Buffer.from([0xff, 0xfe]);
 const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+const DEFAULT_TEXT_SOURCE = "手动输入";
 
 const openai = new OpenAI({
   apiKey: process.env.DASHSCOPE_API_KEY,
@@ -34,14 +36,23 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function createPrompt(context, question) {
+function createPrompt(topChunks, question) {
+  const context = topChunks
+    .map((chunk, index) => [
+      `[片段${index + 1}]`,
+      `来源: ${chunk.source}`,
+      `相关度: ${chunk.score.toFixed(4)}`,
+      chunk.text
+    ].join("\n"))
+    .join("\n\n---\n\n");
+
   return [
-    "你是一个企业级知识助手，请严格按照以下规则回答：",
-    "1. 只能基于提供的内容回答",
-    "2. 回答要结构清晰（分点）",
-    "3. 如果没有答案，说“无法从文档中找到”",
+    "你是一个企业级知识助手，请严格遵守以下规则：",
+    "1. 只能根据给定片段回答，禁止补充片段里没有的信息。",
+    "2. 如果片段不足以支持答案，直接回答“无法从文档中找到”。",
+    "3. 优先引用原文中的关键表述，不要改写出片段里不存在的事实。",
     "",
-    "【内容】",
+    "【文档片段】",
     context,
     "",
     "【问题】",
@@ -143,6 +154,19 @@ function writeStreamMessage(res, payload) {
   res.write(`${JSON.stringify(payload)}\n`);
 }
 
+function buildTopChunkPayload(chunk) {
+  return {
+    score: chunk.score,
+    source: chunk.source,
+    chunkIndex: chunk.chunkIndex,
+    preview: createPreview(chunk.text, 160)
+  };
+}
+
+function resetKnowledgeBase() {
+  knowledgeBase = [];
+}
+
 async function createEmbedding(input) {
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
@@ -155,42 +179,51 @@ async function createEmbedding(input) {
 async function getRelevantContext(question) {
   const questionEmbedding = await createEmbedding(question);
 
-  const topChunks = knowledgeBase
+  const rankedChunks = knowledgeBase
     .map((item) => ({
-      text: item.text,
+      ...item,
       score: cosineSimilarity(questionEmbedding, item.embedding)
     }))
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => b.score - a.score);
+
+  const topChunks = rankedChunks
+    .filter((chunk) => chunk.score >= MIN_RELEVANCE_SCORE)
     .slice(0, TOP_K);
 
   return {
-    context: topChunks.map((chunk) => chunk.text).join("\n"),
-    topChunks
+    topChunks,
+    fallbackTopChunks: rankedChunks.slice(0, TOP_K)
   };
 }
 
-async function createChatStream(question, context) {
+async function createChatStream(question, topChunks) {
   return openai.chat.completions.create({
     model: CHAT_MODEL,
     stream: true,
     messages: [
-      { role: "system", content: "你是一个企业级知识助手" },
-      { role: "user", content: createPrompt(context, question) }
+      {
+        role: "system",
+        content: "你是一个严谨的企业知识库问答助手。只能依据提供的文档片段回答，禁止使用片段之外的知识。"
+      },
+      { role: "user", content: createPrompt(topChunks, question) }
     ]
   });
 }
 
-async function createChatCompletion(question, context) {
+async function createChatCompletion(question, topChunks) {
   return openai.chat.completions.create({
     model: CHAT_MODEL,
     messages: [
-      { role: "system", content: "你是一个企业级知识助手" },
-      { role: "user", content: createPrompt(context, question) }
+      {
+        role: "system",
+        content: "你是一个严谨的企业知识库问答助手。只能依据提供的文档片段回答，禁止使用片段之外的知识。"
+      },
+      { role: "user", content: createPrompt(topChunks, question) }
     ]
   });
 }
 
-async function addTextToKnowledgeBase(text) {
+async function addTextToKnowledgeBase(text, source = DEFAULT_TEXT_SOURCE) {
   const normalizedText = normalizeText(text);
   const chunks = splitText(normalizedText);
 
@@ -202,7 +235,9 @@ async function addTextToKnowledgeBase(text) {
 
   const entries = chunks.map((chunk, index) => ({
     text: chunk,
-    embedding: embeddings[index]
+    embedding: embeddings[index],
+    source,
+    chunkIndex: index + 1
   }));
 
   knowledgeBase = knowledgeBase.concat(entries);
@@ -250,6 +285,36 @@ function sendErrorResponse(res, error, fallbackMessage) {
   });
 }
 
+function sendNoMatchResponse(res, question, stream, fallbackTopChunks = []) {
+  const answer = "无法从文档中找到";
+  const topChunks = fallbackTopChunks.map(buildTopChunkPayload);
+
+  if (stream === true) {
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    writeStreamMessage(res, {
+      type: "start",
+      question,
+      topChunks
+    });
+    writeStreamMessage(res, {
+      type: "done",
+      answer
+    });
+    res.end();
+    return;
+  }
+
+  res.json({
+    answer,
+    topChunks
+  });
+}
+
 app.post("/api/chat", async (req, res) => {
   try {
     const { question, stream } = req.body;
@@ -266,7 +331,11 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const { context, topChunks } = await getRelevantContext(question);
+    const { topChunks, fallbackTopChunks } = await getRelevantContext(question);
+
+    if (topChunks.length === 0) {
+      return sendNoMatchResponse(res, question, stream, fallbackTopChunks);
+    }
 
     if (stream === true) {
       res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -275,16 +344,13 @@ app.post("/api/chat", async (req, res) => {
       res.setHeader("X-Accel-Buffering", "no");
       res.flushHeaders?.();
 
-      const completionStream = await createChatStream(question, context);
+      const completionStream = await createChatStream(question, topChunks);
       let answer = "";
 
       writeStreamMessage(res, {
         type: "start",
         question,
-        topChunks: topChunks.map((chunk) => ({
-          score: chunk.score,
-          preview: createPreview(chunk.text, 120)
-        }))
+        topChunks: topChunks.map(buildTopChunkPayload)
       });
 
       for await (const chunk of completionStream) {
@@ -309,14 +375,12 @@ app.post("/api/chat", async (req, res) => {
       return;
     }
 
-    const completion = await createChatCompletion(question, context);
+    const completion = await createChatCompletion(question, topChunks);
+    const finalAnswer = completion.choices[0]?.message?.content ?? "无法从文档中找到";
 
     res.json({
-      answer: completion.choices[0]?.message?.content ?? "无法从文档中找到",
-      topChunks: topChunks.map((chunk) => ({
-        score: chunk.score,
-        preview: createPreview(chunk.text, 120)
-      }))
+      answer: finalAnswer,
+      topChunks: topChunks.map(buildTopChunkPayload)
     });
   } catch (error) {
     console.error("Chat error:", error);
@@ -344,7 +408,8 @@ app.post("/api/upload", upload.none(), async (req, res) => {
       });
     }
 
-    const addedChunks = await addTextToKnowledgeBase(text);
+    resetKnowledgeBase();
+    const addedChunks = await addTextToKnowledgeBase(text, DEFAULT_TEXT_SOURCE);
 
     res.json({
       message: `Successfully processed ${addedChunks} chunks`,
@@ -368,6 +433,8 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
       });
     }
 
+    resetKnowledgeBase();
+
     let totalChunksAdded = 0;
     const filePreviews = [];
 
@@ -384,7 +451,7 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
         continue;
       }
 
-      const chunksAdded = await addTextToKnowledgeBase(text);
+      const chunksAdded = await addTextToKnowledgeBase(text, file.originalname);
       totalChunksAdded += chunksAdded;
       filePreviews.push({
         fileName: file.originalname,

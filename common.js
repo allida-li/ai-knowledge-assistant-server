@@ -1,9 +1,34 @@
-function splitText(text, chunkSize = 200) {
+function splitText(text, chunkSize = 600, overlap = 120) {
   if (!text || chunkSize <= 0) return [];
 
+  const normalizedText = text.replace(/\r\n/g, "\n").trim();
+  if (!normalizedText) return [];
+
   const chunks = [];
-  for (let i = 0; i < text.length; i += chunkSize) {
-    chunks.push(text.slice(i, i + chunkSize));
+  let start = 0;
+
+  while (start < normalizedText.length) {
+    let end = Math.min(start + chunkSize, normalizedText.length);
+
+    if (end < normalizedText.length) {
+      const searchStart = Math.max(start, end - 80);
+      const breakpoint = normalizedText.lastIndexOf("\n", end);
+
+      if (breakpoint >= searchStart) {
+        end = breakpoint;
+      }
+    }
+
+    const chunk = normalizedText.slice(start, end).trim();
+    if (chunk) {
+      chunks.push(chunk);
+    }
+
+    if (end >= normalizedText.length) {
+      break;
+    }
+
+    start = Math.max(end - overlap, start + 1);
   }
 
   return chunks;
