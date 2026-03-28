@@ -17,6 +17,10 @@ app.use(express.json());
 
 const EMBEDDING_MODEL = "text-embedding-v1";
 const CHAT_MODEL = "qwen-turbo";
+const PDF_OCR_MODEL = process.env.PDF_OCR_MODEL || "qwen-vl-max-latest";
+const PDF_OCR_MAX_PAGES = Number.parseInt(process.env.PDF_OCR_MAX_PAGES ?? "5", 10);
+const PDF_OCR_SCALE = Number.parseFloat(process.env.PDF_OCR_SCALE ?? "1.5");
+const MIN_EXTRACTED_TEXT_LENGTH = 20;
 const TOP_K = 6;
 const MIN_RELEVANCE_SCORE = 0.2;
 const PDF_MIME_TYPE = "application/pdf";
@@ -150,6 +154,14 @@ function createPreview(text, maxLength = 200) {
   return text.slice(0, maxLength);
 }
 
+function buildUploadMarkdown({ preview }) {
+  if (isNonEmptyString(preview)) {
+    return `> ${preview.replace(/\n+/g, "\n> ")}`;
+  }
+
+  return "";
+}
+
 function writeStreamMessage(res, payload) {
   res.write(`${JSON.stringify(payload)}\n`);
 }
@@ -165,6 +177,184 @@ function buildTopChunkPayload(chunk) {
 
 function resetKnowledgeBase() {
   knowledgeBase = [];
+}
+
+function cleanExtractedPdfText(text) {
+  return normalizeText(
+    text
+      .replace(/\u0000/g, "")
+      .replace(/\u00AD/g, "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+  );
+}
+
+function scoreExtractedPdfText(text) {
+  if (!isNonEmptyString(text)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const compactText = text.replace(/\s+/g, "");
+  const replacementCharCount = (text.match(/\uFFFD/g) || []).length;
+  const controlCharCount = (text.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) || []).length;
+  const cjkCharCount = (text.match(/[\u3400-\u9FFF]/g) || []).length;
+
+  return compactText.length + cjkCharCount * 2 - replacementCharCount * 20 - controlCharCount * 10;
+}
+
+function isUsableExtractedPdfText(text) {
+  if (!isNonEmptyString(text)) {
+    return false;
+  }
+
+  const compactText = text.replace(/\s+/g, "");
+  if (compactText.length < MIN_EXTRACTED_TEXT_LENGTH) {
+    return false;
+  }
+
+  return !looksMisdecoded(text);
+}
+
+function pickBestExtractedPdfText(...texts) {
+  return texts
+    .map((text) => cleanExtractedPdfText(text || ""))
+    .sort((left, right) => scoreExtractedPdfText(right) - scoreExtractedPdfText(left))[0] ?? "";
+}
+
+function extractCompletionText(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .map((item) => {
+      if (typeof item === "string") {
+        return item;
+      }
+
+      if (item && typeof item === "object" && "text" in item && typeof item.text === "string") {
+        return item.text;
+      }
+
+      return "";
+    })
+    .join("\n");
+}
+
+async function extractPdfTextWithParser(buffer) {
+  const parser = new PDFParse({ data: new Uint8Array(buffer) });
+
+  try {
+    const defaultResult = await parser.getText({
+      lineEnforce: true,
+      pageJoiner: "\n\n",
+      itemJoiner: ""
+    });
+    const rawResult = await parser.getText({
+      lineEnforce: true,
+      disableNormalization: true,
+      pageJoiner: "\n\n",
+      itemJoiner: ""
+    });
+
+    return pickBestExtractedPdfText(defaultResult.text, rawResult.text);
+  } finally {
+    await parser.destroy();
+  }
+}
+
+async function extractPdfTextWithOcr(buffer, originalname) {
+  const parser = new PDFParse({ data: new Uint8Array(buffer) });
+
+  try {
+    const screenshotResult = await parser.getScreenshot({
+      first: PDF_OCR_MAX_PAGES,
+      scale: PDF_OCR_SCALE,
+      imageBuffer: false,
+      imageDataUrl: true
+    });
+
+    if (!Array.isArray(screenshotResult.pages) || screenshotResult.pages.length === 0) {
+      throw createHttpError(400, `Uploaded PDF "${originalname}" does not contain renderable pages`);
+    }
+
+    const userContent = [
+      {
+        type: "text",
+        text: [
+          "请对这些 PDF 页面做 OCR，只输出页面中的原文内容。",
+          "要求：",
+          "1. 不要总结，不要解释，不要补充。",
+          "2. 尽量保留段落、标题、列表和换行。",
+          "3. 如果看到表格，按阅读顺序输出每一行。",
+          "4. 按页顺序输出内容。"
+        ].join("\n")
+      },
+      ...screenshotResult.pages.flatMap((page) => ([
+        {
+          type: "text",
+          text: `第 ${page.pageNumber} 页`
+        },
+        {
+          type: "image_url",
+          image_url: {
+            url: page.dataUrl
+          }
+        }
+      ]))
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: PDF_OCR_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: userContent
+        }
+      ]
+    });
+
+    const ocrText = cleanExtractedPdfText(
+      extractCompletionText(completion.choices[0]?.message?.content)
+    );
+
+    if (!isUsableExtractedPdfText(ocrText)) {
+      throw createHttpError(400, `Uploaded PDF "${originalname}" could not be OCR processed`);
+    }
+
+    return ocrText;
+  } finally {
+    await parser.destroy();
+  }
+}
+
+async function extractPdfText(file) {
+  const parserText = await extractPdfTextWithParser(file.buffer);
+
+  if (isUsableExtractedPdfText(parserText)) {
+    return parserText;
+  }
+
+  try {
+    return await extractPdfTextWithOcr(file.buffer, file.originalname);
+  } catch (ocrError) {
+    if (isUsableExtractedPdfText(parserText)) {
+      return parserText;
+    }
+
+    if (isNonEmptyString(parserText)) {
+      return parserText;
+    }
+
+    throw createHttpError(
+      400,
+      `Uploaded PDF "${file.originalname}" does not contain readable text. OCR fallback also failed: ${getErrorMessage(ocrError)}`
+    );
+  }
 }
 
 async function createEmbedding(input) {
@@ -251,19 +441,7 @@ async function extractTextFromFile(file) {
   }
 
   if (file.mimetype === PDF_MIME_TYPE) {
-    const parser = new PDFParse({ data: new Uint8Array(file.buffer) });
-
-    try {
-      const pdfData = await parser.getText();
-
-      if (!isNonEmptyString(pdfData.text)) {
-        throw createHttpError(400, `Uploaded PDF "${file.originalname}" does not contain readable text`);
-      }
-
-      return normalizeText(pdfData.text);
-    } finally {
-      await parser.destroy();
-    }
+    return extractPdfText(file);
   }
 
   if (file.mimetype?.startsWith(TEXT_MIME_PREFIX) || !file.mimetype) {
@@ -410,9 +588,14 @@ app.post("/api/upload", upload.none(), async (req, res) => {
 
     resetKnowledgeBase();
     const addedChunks = await addTextToKnowledgeBase(text, DEFAULT_TEXT_SOURCE);
+    const message = `Successfully processed ${addedChunks} chunks`;
+    const markdown = buildUploadMarkdown({
+      preview: normalizeText(text)
+    });
 
     res.json({
-      message: `Successfully processed ${addedChunks} chunks`,
+      message,
+      markdown,
       chunksAdded: addedChunks,
       chunksCount: knowledgeBase.length,
       status: "200"
