@@ -162,6 +162,18 @@ function buildUploadMarkdown({ preview }) {
   return "";
 }
 
+function buildUploadFilesMarkdown(files) {
+  return files
+    .filter((file) => file.chunksAdded > 0 && isNonEmptyString(file.content))
+    .map((file) => ([
+      file.content
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n")
+    ].join("\n")))
+    .join("\n\n");
+}
+
 function writeStreamMessage(res, payload) {
   res.write(`${JSON.stringify(payload)}\n`);
 }
@@ -629,7 +641,8 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
           fileName: file.originalname,
           mimetype: file.mimetype,
           preview: "",
-          chunksAdded: 0
+          chunksAdded: 0,
+          content: ""
         });
         continue;
       }
@@ -640,7 +653,8 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
         fileName: file.originalname,
         mimetype: file.mimetype,
         preview: createPreview(text),
-        chunksAdded
+        chunksAdded,
+        content: text
       });
     }
 
@@ -650,8 +664,11 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
       });
     }
 
+    const markdown = buildUploadFilesMarkdown(filePreviews);
+
     res.json({
       message: "Files processed successfully",
+      markdown,
       filesCount: files.length,
       chunksAdded: totalChunksAdded,
       chunksCount: knowledgeBase.length,
