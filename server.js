@@ -18,10 +18,26 @@ const upload = multer({
   }
 });
 
+const allowedOrigins = [
+  "http://localhost:3000",      // 本地开发
+  "https://aida-assistant.vercel.app" // 上线后的前端
+];
+
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
-app.use(cors());
+app.use(cors(
+  {
+    origin(origin, callback) {
+      // 允许没有 origin（比如 curl / postman）
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    }
+  }
+));
 app.use(express.json({
   limit: process.env.JSON_BODY_LIMIT || "2mb"
 }));
@@ -190,10 +206,9 @@ function buildUploadMarkdown({ preview }) {
 
 function buildUploadFilesMarkdown(files) {
   return files
-    .filter((file) => file.chunksAdded > 0 && isNonEmptyString(file.preview))
+    .filter((file) => file.chunksAdded > 0 && isNonEmptyString(file.content))
     .map((file) => [
-      `> 文件: ${file.fileName}`,
-      file.preview
+      file.content
         .split("\n")
         .map((line) => `> ${line}`)
         .join("\n")
@@ -769,9 +784,8 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
 
       if (!isNonEmptyString(text)) {
         filePreviews.push({
-          fileName: file.originalname,
           mimetype: file.mimetype,
-          preview: "",
+          content: "",
           chunksAdded: 0
         });
         continue;
@@ -782,9 +796,8 @@ app.post("/api/uploadFiles", upload.array("files"), async (req, res) => {
       totalChunksAdded += entries.length;
 
       filePreviews.push({
-        fileName: file.originalname,
         mimetype: file.mimetype,
-        preview: createPreview(normalizeText(text), 800),
+        content: normalizeText(text),
         chunksAdded: entries.length
       });
     }
