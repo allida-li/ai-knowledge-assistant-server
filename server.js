@@ -10,7 +10,13 @@ import { cosineSimilarity, splitText } from "./common.js";
 dotenv.config();
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:{
+    fileSize: 20 * 1024 * 1024, // 20 MB file size limit,
+    files: 5 // limit to 5 files per upload
+  }
+});
 
 app.use(cors());
 app.use(express.json());
